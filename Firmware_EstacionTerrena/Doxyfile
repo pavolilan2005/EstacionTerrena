@@ -1,0 +1,29 @@
+# Configuracion Doxygen para el firmware ASTRA I (ESP-IDF).
+PROJECT_NAME           = "ASTRA I - Receptor LoRa"
+PROJECT_NUMBER         = "1.0"
+PROJECT_BRIEF          = "Estacion receptora ESP32 con SX1278, ST7789 y panel Wi-Fi"
+OUTPUT_DIRECTORY       = docs/doxygen
+
+INPUT                  = main
+FILE_PATTERNS          = *.h *.c
+RECURSIVE              = YES
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_PRIVATE        = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = YES
+INPUT_ENCODING         = UTF-8
+USE_MDFILE_AS_MAINPAGE =
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+GENERATE_MAN           = NO
+GENERATE_RTF           = NO
+GENERATE_XML           = NO
+GENERATE_TREEVIEW      = YES
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
