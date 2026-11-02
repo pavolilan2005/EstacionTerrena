@@ -540,7 +540,7 @@
       "netlist": "",
       "plot": "../../Gerbers/",
       "specctra_dsn": "",
-      "step": "",
+      "step": "../../Modelo3D/Estación terreno.stl",
       "vrml": ""
     },
     "page_layout_descr_file": ""
