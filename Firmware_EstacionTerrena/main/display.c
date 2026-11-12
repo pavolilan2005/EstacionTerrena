@@ -1,4 +1,11 @@
-/** @file display.c @brief Dibujo del panel vertical y gráfica de temperatura. */
+/**
+ * @file display.c
+ * @brief Interfaz gráfica ST7789 para telemetría, enlace y métricas.
+ * @version 1.0.5
+ *
+ * El dibujo usa SPI2 compartido con LoRa, bloques RGB565 y un semáforo de
+ * finalización DMA para reutilizar cada bloque de memoria de forma segura.
+ */
 #include "display.h"
 
 #include <ctype.h>
@@ -6,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -22,11 +30,12 @@
 #define PIN_SPI_SCK       18
 #define PIN_SPI_MOSI      23
 #define PIN_SPI_MISO      19
-#define PIN_TFT_CS        15
+#define PIN_TFT_CS        12
 #define PIN_TFT_DC         2
 #define PIN_TFT_RST        4
-#define TFT_WIDTH        240
-#define TFT_HEIGHT       320
+#define PIN_TFT_BL        27
+#define TFT_WIDTH        320
+#define TFT_HEIGHT       240
 #define DRAW_CHUNK        16
 #define GRAPH_WIDTH      220
 #define GRAPH_HEIGHT      56
@@ -109,6 +118,8 @@ static uint32_t displayed_received;
 static uint32_t displayed_lost;
 /** RSSI del último paquete mostrado, en dBm. */
 static int displayed_rssi;
+static float displayed_loss_percent;
+static float displayed_cpu_percent;
 /** Índice de la página activa: 0 ambiente, 1 movimiento. */
 static unsigned active_page;
 /** Tick en que se dibujó la página actual, para alternar páginas. */
@@ -594,13 +605,32 @@ static void render_imu_values(void)
 /** @brief Redibuja el contenido de la página activa y su pie de enlace. */
 static void draw_current_page(void)
 {
-    if (active_page == 0) {
-        draw_environment_page_frame();
-        render_environment_values();
-    } else {
-        draw_imu_page_frame();
-        render_imu_values();
-    }
+    char line[48];
+    fill_screen(COLOR_BG);
+    draw_text(8, 6, "ESTACION TERRENA LORA", COLOR_CYAN);
+    draw_text(8, 22, link_online ? "ENLACE ACTIVO" : "SIN SENAL LORA", link_online ? COLOR_GREEN : COLOR_YELLOW);
+    snprintf(line, sizeof(line), "BME T:%5.1f C", (double)telemetry.bme_temp);
+    draw_text(8, 42, line, COLOR_WHITE);
+    snprintf(line, sizeof(line), "PRES:%6.1f hPa", (double)telemetry.pressure);
+    draw_text(168, 42, line, COLOR_WHITE);
+    snprintf(line, sizeof(line), "HUM:%5.1f %%", (double)telemetry.humidity);
+    draw_text(8, 60, line, COLOR_WHITE);
+    snprintf(line, sizeof(line), "GAS:%lu ohm", (unsigned long)telemetry.gas);
+    draw_text(168, 60, line, COLOR_WHITE);
+    snprintf(line, sizeof(line), "ACC X:%6.3f g", (double)telemetry.accel_x);
+    draw_text(8, 84, line, COLOR_CYAN);
+    snprintf(line, sizeof(line), "ACC Y:%6.3f g", (double)telemetry.accel_y);
+    draw_text(8, 102, line, COLOR_CYAN);
+    snprintf(line, sizeof(line), "ACC Z:%6.3f g", (double)telemetry.accel_z);
+    draw_text(8, 120, line, COLOR_CYAN);
+    snprintf(line, sizeof(line), "GYR X:%6.2f dps", (double)telemetry.gyro_x);
+    draw_text(168, 84, line, COLOR_CYAN);
+    snprintf(line, sizeof(line), "GYR Y:%6.2f dps", (double)telemetry.gyro_y);
+    draw_text(168, 102, line, COLOR_CYAN);
+    snprintf(line, sizeof(line), "GYR Z:%6.2f dps", (double)telemetry.gyro_z);
+    draw_text(168, 120, line, COLOR_CYAN);
+    snprintf(line, sizeof(line), "MPU TEMP:%5.2f C", (double)telemetry.mpu_temp);
+    draw_text(8, 145, line, COLOR_WHITE);
     draw_link_footer();
 }
 
@@ -608,16 +638,18 @@ static void draw_current_page(void)
 static void draw_link_footer(void)
 {
     char line[48];
-    fill_rect(10, 297, 220, 22, COLOR_BG);
-    snprintf(line, sizeof(line), "RX %lu  LOST %lu",
+    fill_rect(0, 206, 320, 34, COLOR_BG);
+    snprintf(line, sizeof(line), "RX:%lu LOST:%lu (%.2f%%) CPU:%.1f%%",
              (unsigned long)displayed_received,
-             (unsigned long)displayed_lost);
-    draw_text(10, 299, line, COLOR_WHITE);
+             (unsigned long)displayed_lost,
+             (double)displayed_loss_percent,
+             (double)displayed_cpu_percent);
+    draw_text(8, 210, line, COLOR_WHITE);
     if (link_online) {
-        snprintf(line, sizeof(line), "LINK OK  RSSI %d", displayed_rssi);
-        draw_text(10, 310, line, COLOR_GREEN);
+        snprintf(line, sizeof(line), "OK RSSI:%d dBm", displayed_rssi);
+        draw_text(8, 226, line, COLOR_GREEN);
     } else {
-        draw_text(10, 310, "SIN DATOS - BUSCANDO", COLOR_YELLOW);
+        draw_text(8, 226, "SIN DATOS - ESCUCHANDO", COLOR_YELLOW);
     }
 }
 
@@ -649,6 +681,10 @@ static void draw_rule(int y, uint16_t color)
  */
 esp_err_t display_init(void)
 {
+    ESP_RETURN_ON_ERROR(gpio_set_direction(PIN_TFT_BL, GPIO_MODE_OUTPUT), TAG,
+                        "No se pudo configurar backlight TFT");
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_TFT_BL, 1), TAG,
+                        "No se pudo encender backlight TFT");
     color_done_sem = xSemaphoreCreateBinary();
     ESP_RETURN_ON_FALSE(color_done_sem != NULL, ESP_ERR_NO_MEM, TAG,
                         "No se pudo crear el semaforo de dibujo");
@@ -692,10 +728,8 @@ esp_err_t display_init(void)
                         TAG, "No se pudo crear el panel ST7789");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "Reset de TFT fallo");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "Init de TFT fallo");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(panel, false), TAG, "Rotacion de TFT fallo");
-    // La TFT de este modulo necesita swap XY sin espejo para leer el texto normal.
-    // En orientacion nativa vertical, este panel requiere invertir el eje X para leer normal.
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(panel, true, false), TAG, "Orientacion de TFT fallo");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(panel, true), TAG, "Rotacion de TFT fallo");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(panel, false, false), TAG, "Orientacion de TFT fallo");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "TFT no encendio");
 
     fill_screen(COLOR_BG);
@@ -762,15 +796,12 @@ void display_show_packet(const lora_packet_t *packet)
     displayed_received = packet->packet_count;
     displayed_lost = packet->lost_count;
     displayed_rssi = packet->rssi_dbm;
+    displayed_loss_percent = packet->loss_percent;
+    displayed_cpu_percent = packet->cpu_percent;
     link_online = true;
     last_packet_tick = xTaskGetTickCount();
 
-    if (telemetry.has_bme_temp) {
-        graph_add_temperature(telemetry.bme_temp, active_page == 0);
-    }
-    if (active_page == 0) render_environment_values();
-    else render_imu_values();
-    draw_link_footer();
+    draw_current_page();
 }
 
 /**
@@ -784,10 +815,10 @@ void display_check_link_timeout(void)
     TickType_t now = xTaskGetTickCount();
     bool status_changed = false;
     if (link_online &&
-        (TickType_t)(now - last_packet_tick) >= pdMS_TO_TICKS(3000)) {
+        (TickType_t)(now - last_packet_tick) >= pdMS_TO_TICKS(5000)) {
         link_online = false;
         status_changed = true;
-        ESP_LOGW(TAG, "Sin paquetes durante 3 s; se sigue escuchando LoRa");
+        ESP_LOGW(TAG, "Sin paquetes durante 5 s; se sigue escuchando LoRa");
     }
 
     if ((TickType_t)(now - page_started_tick) >= pdMS_TO_TICKS(5000)) {
@@ -797,4 +828,13 @@ void display_check_link_timeout(void)
     } else if (status_changed) {
         draw_link_footer();
     }
+}
+
+void display_update_metrics(float loss_percent, float cpu_percent)
+{
+    bool changed = ((int)(displayed_loss_percent * 100.0f) != (int)(loss_percent * 100.0f)) ||
+                   ((int)(displayed_cpu_percent * 10.0f) != (int)(cpu_percent * 10.0f));
+    displayed_loss_percent = loss_percent;
+    displayed_cpu_percent = cpu_percent;
+    if (changed) draw_link_footer();
 }

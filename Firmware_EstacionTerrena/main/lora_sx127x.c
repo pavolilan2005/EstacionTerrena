@@ -1,6 +1,14 @@
-/** @file lora_sx127x.c @brief Acceso por SPI y recepción de paquetes SX127x. */
+/**
+ * @file lora_sx127x.c
+ * @brief Controlador de bajo nivel del transceptor SX1276/SX1278.
+ * @version 1.0.5
+ *
+ * Comparte SPI2 con la TFT; la selección NSS es independiente para cada
+ * periférico. El controlador sondea la recepción para no bloquear tareas.
+ */
 #include "lora_sx127x.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -46,6 +54,8 @@
 #define REG_PA_CONFIG        0x09
 #define REG_OCP              0x0B
 #define REG_LNA              0x0C
+#define REG_IRQ_FLAGS_MASK   0x11
+#define REG_DIO_MAPPING_1    0x40
 /** @} */
 
 /** @name Modos de operación
@@ -55,6 +65,7 @@
 #define MODE_SLEEP           0x00
 #define MODE_STANDBY         0x01
 #define MODE_RX_CONTINUOUS   0x05
+#define MODE_TX              0x03
 /** @} */
 
 /** Etiqueta para mensajes del controlador SX127x. */
@@ -241,14 +252,13 @@ bool lora_sx127x_receive(lora_packet_t *packet)
         return false;
     }
 
+    size_t safe_length = length < sizeof(packet->payload) - 1 ? length : sizeof(packet->payload) - 1;
     if (write_reg(REG_FIFO_ADDR_PTR, fifo_address) != ESP_OK ||
-        read_fifo((uint8_t *)packet->payload, length) != ESP_OK) {
+        read_fifo((uint8_t *)packet->payload, safe_length) != ESP_OK) {
         return false;
     }
 
-    packet->length = length < sizeof(packet->payload) - 1
-                         ? length
-                         : sizeof(packet->payload) - 1;
+    packet->length = safe_length;
     packet->payload[packet->length] = '\0';
 
     uint8_t raw_rssi = 0;
@@ -259,6 +269,60 @@ bool lora_sx127x_receive(lora_packet_t *packet)
     packet->snr_db = ((int8_t)raw_snr) / 4.0f;
     packet->packet_count = ++received_count;
     return true;
+}
+
+/** @brief Escribe bytes consecutivos en la FIFO TX del transceptor.
+ * @param[in] data Bytes que se transmitirán.
+ * @param[in] length Longitud entre 1 y 255 bytes.
+ * @return ESP_ERR_INVALID_ARG para longitud inválida; estado de SPI en otro caso.
+ */
+static esp_err_t write_fifo(const uint8_t *data, size_t length)
+{
+    if (length == 0 || length > 255) return ESP_ERR_INVALID_ARG;
+    uint8_t tx[256] = {0};
+    tx[0] = REG_FIFO | 0x80;
+    memcpy(&tx[1], data, length);
+    spi_transaction_t t = {0};
+    t.length = (length + 1) * 8;
+    t.tx_buffer = tx;
+    return spi_device_polling_transmit(radio_spi, &t);
+}
+
+/**
+ * @brief Transmite el acuse de una secuencia y rearma RX continuo.
+ * @param[in] sequence Secuencia de 8 bits que se confirma al nodo transmisor.
+ * @return ESP_OK al completar TX; error si SPI falla o vence el tiempo TX.
+ *
+ * El ACK se envía como `$A,<secuencia>,OK` con terminación CR/LF.
+ */
+esp_err_t lora_sx127x_send_ack(uint8_t sequence)
+{
+    char ack[24];
+    int n = snprintf(ack, sizeof(ack), "$A,%u,OK\r\n", (unsigned)sequence);
+    if (n <= 0 || n >= sizeof(ack)) return ESP_FAIL;
+    ESP_RETURN_ON_ERROR(set_mode(MODE_STANDBY), TAG, "TX ACK standby fallo");
+    ESP_RETURN_ON_ERROR(write_reg(REG_IRQ_FLAGS, 0xFF), TAG, "Limpiar IRQ TX fallo");
+    ESP_RETURN_ON_ERROR(write_reg(REG_FIFO_ADDR_PTR, 0), TAG, "FIFO ptr ACK fallo");
+    ESP_RETURN_ON_ERROR(write_fifo((const uint8_t *)ack, (size_t)n), TAG, "FIFO ACK fallo");
+    ESP_RETURN_ON_ERROR(write_reg(REG_PAYLOAD_LENGTH, (uint8_t)n), TAG, "Longitud ACK fallo");
+    ESP_RETURN_ON_ERROR(write_reg(REG_DIO_MAPPING_1, 0x40), TAG, "Mapeo TxDone fallo");
+    ESP_RETURN_ON_ERROR(set_mode(MODE_TX), TAG, "Iniciar TX ACK fallo");
+    TickType_t start = xTaskGetTickCount();
+    uint8_t flags = 0;
+    do {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        ESP_RETURN_ON_ERROR(read_reg(REG_IRQ_FLAGS, &flags), TAG, "Leer IRQ ACK fallo");
+    } while (!(flags & 0x08) && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(1500));
+    if (!(flags & 0x08)) {
+        (void)write_reg(REG_IRQ_FLAGS, 0xFF);
+        (void)write_reg(REG_DIO_MAPPING_1, 0x00);
+        (void)set_mode(MODE_RX_CONTINUOUS);
+        return ESP_ERR_TIMEOUT;
+    }
+    ESP_RETURN_ON_ERROR(write_reg(REG_IRQ_FLAGS, 0xFF), TAG, "Limpiar TxDone fallo");
+    ESP_RETURN_ON_ERROR(write_reg(REG_DIO_MAPPING_1, 0x00), TAG, "Mapeo RxDone fallo");
+    ESP_RETURN_ON_ERROR(set_mode(MODE_RX_CONTINUOUS), TAG, "Volver RX tras ACK fallo");
+    return ESP_OK;
 }
 
 /**

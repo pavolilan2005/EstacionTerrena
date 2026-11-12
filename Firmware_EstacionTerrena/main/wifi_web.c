@@ -1,4 +1,11 @@
-/** @file wifi_web.c @brief AP Wi-Fi, API JSON y panel web con gráficas. */
+/**
+ * @file wifi_web.c
+ * @brief Punto de acceso Wi-Fi, API JSON y dashboard web de telemetría.
+ * @version 1.0.5
+ *
+ * El servidor conserva un snapshot protegido por mutex para desacoplar el
+ * procesamiento LoRa de las solicitudes HTTP de los clientes conectados.
+ */
 #include "wifi_web.h"
 
 #include <ctype.h>
@@ -16,10 +23,12 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
-/** Nombre de la red local creada por el receptor. */
+/** @name Ajustes de red del punto de acceso de la estación
+ * Cambia estas credenciales antes de utilizar el equipo en una red compartida.
+ * @{ */
 #define WIFI_AP_SSID     "ASTRA-I-RX"
-/** Clave WPA2 del punto de acceso; cámbiese antes de un despliegue público. */
 #define WIFI_AP_PASSWORD "ASTRA-I-2026"
+/** @} */
 
 /** Etiqueta de registro del subsistema Wi-Fi/HTTP. */
 static const char *TAG = "wifi_web";
@@ -65,6 +74,9 @@ static const char INDEX_HTML[] =
 "<h2>ENLACE LORA</h2><section class='grid'>"
 "<article class='card'><div class='label'>Paquetes recibidos</div><div class='value' id='rx'>0</div></article>"
 "<article class='card'><div class='label'>Paquetes perdidos</div><div class='value' id='lost'>0</div></article>"
+"<article class='card'><div class='label'>Perdida acumulada</div><div class='value'><span id='lossPct'>0.00</span><span class='unit'>%</span></div></article>"
+"<article class='card'><div class='label'>Uso de CPU (2 nucleos)</div><div class='value'><span id='cpuPct'>--</span><span class='unit'>%</span></div></article>"
+"<article class='card'><div class='label'>Errores de trama/ACK</div><div class='value' id='errors'>0</div></article>"
 "<article class='card'><div class='label'>RSSI</div><div class='value'><span id='rssi'>--</span><span class='unit'>dBm</span></div></article>"
 "<article class='card'><div class='label'>SNR</div><div class='value'><span id='snr'>--</span><span class='unit'>dB</span></div></article></section>"
 "<footer>Actualizacion automatica cada segundo. Los datos aparecen cuando el transmisor los incluye en el paquete.</footer></main>"
@@ -73,7 +85,7 @@ static const char INDEX_HTML[] =
 "const history={temp:[],pres:[],hum:[]};let lastRx=-1;"
 "/* Traza una serie en Canvas, escalando Y al rango de las muestras visibles. */function chart(id,values,color){const c=document.getElementById(id),r=c.getBoundingClientRect(),dpr=window.devicePixelRatio||1;if(r.width<10)return;c.width=r.width*dpr;c.height=r.height*dpr;const g=c.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);const w=r.width,h=r.height,L=38,R=8,T=8,B=20,pw=w-L-R,ph=h-T-B;g.clearRect(0,0,w,h);g.strokeStyle='#18384b';g.lineWidth=1;for(let j=0;j<4;j++){const y=T+ph*j/3;g.beginPath();g.moveTo(L,y);g.lineTo(w-R,y);g.stroke()}const a=values.filter(v=>v!==null);if(!a.length){g.fillStyle='#7895a8';g.fillText('Esperando muestras...',L,T+ph/2);return}let lo=Math.min(...a),hi=Math.max(...a);if(hi-lo<0.1){lo-=0.5;hi+=0.5}else{const pad=(hi-lo)*0.12;lo-=pad;hi+=pad}g.fillStyle='#91adbd';g.font='11px system-ui';g.fillText(hi.toFixed(1),2,T+4);g.fillText(lo.toFixed(1),2,T+ph);g.strokeStyle=color;g.lineWidth=2.5;g.beginPath();let active=false;values.forEach((v,i)=>{if(v===null){active=false;return}const x=L+(values.length<2?0:i*pw/(values.length-1)),y=T+ph-(v-lo)*ph/(hi-lo);if(!active){g.moveTo(x,y);active=true}else g.lineTo(x,y)});g.stroke();g.fillStyle='#7895a8';g.fillText('ultimas '+values.length+' muestras',L,h-4)}"
 "/* Consulta la API y actualiza valores, estado del enlace e historial ambiental. */async function refresh(){try{const r=await fetch('/api/data',{cache:'no-store'});const d=await r.json();const p=parsePayload(d.payload||'');for(const id in aliases){const k=aliases[id].find(x=>p[x]!==undefined);document.getElementById(id).textContent=k?p[k]:'--'}"
-"document.getElementById('rx').textContent=d.rx;document.getElementById('lost').textContent=d.lost;document.getElementById('rssi').textContent=typeof d.rssi==='number'?d.rssi:'--';document.getElementById('snr').textContent=typeof d.snr==='number'?d.snr:'--';"
+"document.getElementById('rx').textContent=d.rx;document.getElementById('lost').textContent=d.lost;document.getElementById('lossPct').textContent=Number(d.loss_pct||0).toFixed(2);document.getElementById('cpuPct').textContent=Number(d.cpu_pct||0).toFixed(1);document.getElementById('errors').textContent=d.errors||0;document.getElementById('rssi').textContent=typeof d.rssi==='number'?d.rssi:'--';document.getElementById('snr').textContent=typeof d.snr==='number'?d.snr:'--';"
 "if(d.rx!==lastRx){lastRx=d.rx;for(const id of ['temp','pres','hum']){const key=aliases[id].find(k=>p[k]!==undefined);history[id].push(key?Number(p[key]):null);if(history[id].length>60)history[id].shift()}}chart('tempChart',history.temp,'#00d9ff');chart('presChart',history.pres,'#ba8cff');chart('humChart',history.hum,'#39efad');"
 "const l=document.getElementById('link');l.textContent=d.online?'ENLACE ACTIVO':'SIN DATOS - BUSCANDO';l.className=d.online?'ok':'bad';document.getElementById('meta').textContent=d.online?`Paquete ${d.rx} · ultimo hace ${d.age_ms} ms`:'El receptor sigue escuchando LoRa';}catch(e){const l=document.getElementById('link');l.textContent='REINTENTANDO';l.className='bad'}}setInterval(refresh,1000);refresh();</script></body></html>";
 
@@ -136,10 +148,13 @@ static esp_err_t data_handler(httpd_req_t *request)
 
     char json[640];
     int length = snprintf(json, sizeof(json),
-                          "{\"online\":%s,\"rx\":%lu,\"lost\":%lu,\"rssi\":%d,\"snr\":%.1f,\"age_ms\":%lu,\"payload\":\"%s\"}",
+                          "{\"online\":%s,\"rx\":%lu,\"lost\":%lu,\"loss_pct\":%.2f,\"cpu_pct\":%.1f,\"errors\":%lu,\"rssi\":%d,\"snr\":%.1f,\"age_ms\":%lu,\"payload\":\"%s\"}",
                           online ? "true" : "false",
                           (unsigned long)snapshot.packet_count,
                           (unsigned long)snapshot.lost_count,
+                          (double)snapshot.loss_percent,
+                          (double)snapshot.cpu_percent,
+                          (unsigned long)snapshot.error_count,
                           valid ? snapshot.rssi_dbm : 0,
                           valid ? (double)snapshot.snr_db : 0.0,
                           (unsigned long)age_ms,
@@ -224,6 +239,23 @@ void wifi_web_update(const lora_packet_t *packet)
         latest_packet = *packet;
         latest_packet_tick = xTaskGetTickCount();
         has_packet = true;
+        xSemaphoreGive(snapshot_mutex);
+    }
+}
+
+/**
+ * @brief Actualiza las métricas del snapshot usadas por `/api/data`.
+ * @param[in] loss_percent Porcentaje acumulado de paquetes LoRa perdidos.
+ * @param[in] cpu_percent Uso estimado de ambos núcleos en porcentaje.
+ * @param[in] errors Errores de trama y de transmisión de ACK.
+ */
+void wifi_web_update_metrics(float loss_percent, float cpu_percent, uint32_t errors)
+{
+    if (snapshot_mutex == NULL) return;
+    if (xSemaphoreTake(snapshot_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        latest_packet.loss_percent = loss_percent;
+        latest_packet.cpu_percent = cpu_percent;
+        latest_packet.error_count = errors;
         xSemaphoreGive(snapshot_mutex);
     }
 }

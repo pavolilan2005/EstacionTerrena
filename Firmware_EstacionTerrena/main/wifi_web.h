@@ -17,3 +17,11 @@ esp_err_t wifi_web_init(void);
  * @param[in] packet Paquete recién recibido; se copia para acceso concurrente.
  */
 void wifi_web_update(const lora_packet_t *packet);
+
+/**
+ * @brief Actualiza métricas globales del panel HTTP sin esperar otro paquete.
+ * @param[in] loss_percent Pérdida acumulada en porcentaje.
+ * @param[in] cpu_percent Uso combinado de CPU en porcentaje.
+ * @param[in] errors Errores de trama y transmisiones ACK fallidas.
+ */
+void wifi_web_update_metrics(float loss_percent, float cpu_percent, uint32_t errors);

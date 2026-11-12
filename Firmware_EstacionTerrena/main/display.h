@@ -23,3 +23,10 @@ void display_show_packet(const lora_packet_t *packet);
 
 /** @brief Actualiza el indicador cuando vence el tiempo sin recibir paquetes. */
 void display_check_link_timeout(void);
+
+/**
+ * @brief Actualiza CPU y pérdida acumulada aunque no llegue un paquete nuevo.
+ * @param[in] loss_percent Pérdida acumulada en porcentaje.
+ * @param[in] cpu_percent Carga combinada estimada de CPU en porcentaje.
+ */
+void display_update_metrics(float loss_percent, float cpu_percent);
